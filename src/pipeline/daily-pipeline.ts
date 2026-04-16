@@ -2,15 +2,17 @@
  * Daily Pipeline Orchestrator
  *
  * Execution order:
- *   1. Prepare shared context (run ID, date, seed topics)
+ *   1. Prepare shared context (run ID, date, seed topics, prior feedback learnings)
  *   2. RESEARCH LAYER — KeywordResearcher → TopicPrioritizer → BrandChecker
- *      (sequential due to data dependency; architecturally the "parallel research tier")
- *   3. Merge outputs into an approved topic list
- *   4. GENERATION LAYER (sequential) — ContentGenerator → CriticReviewer loop
+ *   3. Merge outputs into approved topic list
+ *   4. GENERATION LAYER — ContentGenerator → CriticReviewer (revision loop)
  *      → Editor → ChannelAdapter
- *   5. Push content assets to GitHub
- *   6. Write run metadata to Postgres
- *   7. Return structured run summary
+ *   5. Save full outputs to pipeline_outputs table
+ *   6. Push content assets to GitHub
+ *   7. Write run metadata to pipeline_runs table
+ *   8. Return structured run summary
+ *
+ * Progress events are emitted via onProgress callback after each agent completes.
  */
 
 import { runKeywordResearcherAgent } from "../agents/keyword-researcher";
@@ -20,14 +22,16 @@ import { runContentGeneratorAgent } from "../agents/content-generator";
 import { runCriticReviewerAgent } from "../agents/critic-reviewer";
 import { runEditorAgent } from "../agents/editor";
 import { runChannelAdapterAgent } from "../agents/channel-adapter";
-import { initDb, saveRun } from "../lib/db";
+import { initDb, saveRun, savePipelineOutput, getLatestFeedbackLearnings } from "../lib/db";
 import { pushToGitHub } from "../lib/github";
 import type {
   PipelineContext,
   PipelineResult,
+  PipelineOptions,
   ValidatedTopic,
   ContentGenerationResult,
   Draft,
+  ProgressEvent,
 } from "../lib/types";
 
 // ─── Seed topics ──────────────────────────────────────────────────────────────
@@ -57,7 +61,15 @@ function slugify(title: string): string {
 }
 
 function formatContentFile(
-  adapted: { topic: string; channels: { blog: string; twitter_thread: string[]; linkedin: string; developer_newsletter: string } },
+  adapted: {
+    topic: string;
+    channels: {
+      blog: string;
+      twitter_thread: string[];
+      linkedin: string;
+      developer_newsletter: string;
+    };
+  },
   meta: { date: string; type: string; brandScore: number }
 ): string {
   const { topic, channels } = adapted;
@@ -93,11 +105,23 @@ ${channels.developer_newsletter}
 `;
 }
 
+function progress(
+  onProgress: ((e: ProgressEvent) => void) | undefined,
+  event: Omit<ProgressEvent, "timestamp">
+): void {
+  if (onProgress) {
+    onProgress({ ...event, timestamp: new Date().toISOString() });
+  }
+}
+
 // ─── Main pipeline ────────────────────────────────────────────────────────────
 
-export async function runDailyPipeline(): Promise<PipelineResult> {
-  const runId = crypto.randomUUID();
-  const runDate = new Date().toISOString().split("T")[0]; // YYYY-MM-DD
+export async function runDailyPipeline(
+  options: PipelineOptions = {}
+): Promise<PipelineResult> {
+  const { onProgress } = options;
+  const runId = options.runId ?? crypto.randomUUID();
+  const runDate = new Date().toISOString().split("T")[0];
 
   console.log(`\n${"=".repeat(60)}`);
   console.log(`[Pipeline] Starting run ${runId} — ${runDate}`);
@@ -106,71 +130,112 @@ export async function runDailyPipeline(): Promise<PipelineResult> {
   // ── 0. DB init ──────────────────────────────────────────────────────────────
   await initDb();
 
-  // ── 1. Prepare shared context ───────────────────────────────────────────────
+  // ── 1. Load prior feedback & build context ─────────────────────────────────
+  let feedbackContext = "";
+  try {
+    const learnings = await getLatestFeedbackLearnings(3);
+    if (learnings.length > 0) {
+      const lines: string[] = [];
+      for (const l of learnings) {
+        if (l.improvement_notes) lines.push(l.improvement_notes);
+        if (l.approved_patterns?.length)
+          lines.push(`What worked: ${l.approved_patterns.join("; ")}`);
+        if (l.rejected_patterns?.length)
+          lines.push(`What to avoid: ${l.rejected_patterns.join("; ")}`);
+      }
+      feedbackContext = lines.join("\n");
+      console.log(`[Pipeline] Loaded ${learnings.length} prior feedback learnings`);
+    }
+  } catch {
+    console.warn("[Pipeline] Could not load feedback learnings — proceeding without");
+  }
+
   const ctx: PipelineContext = {
     runId,
     date: runDate,
     seedTopics: SEED_TOPICS,
+    feedbackContext,
   };
 
   // ── 2. Research layer ───────────────────────────────────────────────────────
-  // Note: These three agents form the "parallel research tier" of the architecture.
-  // In this implementation they run in dependency order (KR → TP → BC) because each
-  // agent's output is the next agent's input. The parallelism described in the spec
-  // refers to them being conceptually independent research functions; within this tier
-  // we cannot parallelise KR+TP because TP requires KR's output, and BC requires TP's.
-  // The ChannelAdapterAgent later parallelises its three derived formats (Twitter,
-  // LinkedIn, newsletter) via Promise.all as a concrete example of parallelism.
-
   console.log("[Pipeline] ── RESEARCH LAYER ──────────────────────────────");
 
+  progress(onProgress, {
+    agent: "KeywordResearcher",
+    status: "started",
+    summary: `Researching ${SEED_TOPICS.length} seed topics…`,
+  });
   const keywordResult = await runKeywordResearcherAgent(ctx);
+  progress(onProgress, {
+    agent: "KeywordResearcher",
+    status: "completed",
+    summary: `${keywordResult.keywords.length} keywords generated`,
+    data: { count: keywordResult.keywords.length, topKeywords: keywordResult.keywords.slice(0, 5) },
+  });
+
+  progress(onProgress, {
+    agent: "TopicPrioritizer",
+    status: "started",
+    summary: "Selecting top topics…",
+  });
   const topicResult = await runTopicPrioritizerAgent(ctx, keywordResult);
+  progress(onProgress, {
+    agent: "TopicPrioritizer",
+    status: "completed",
+    summary: `${topicResult.topics.length} topics selected`,
+    data: { topics: topicResult.topics.map((t) => ({ title: t.title, type: t.type, risk: t.cannibalizationRisk })) },
+  });
+
+  progress(onProgress, {
+    agent: "BrandChecker",
+    status: "started",
+    summary: "Validating brand fit…",
+  });
   const brandResult = await runBrandCheckerAgent(ctx, topicResult);
+  const passedBrand = brandResult.validated.filter((v) => v.passed);
+  const failedBrand = brandResult.validated.filter((v) => !v.passed);
+  progress(onProgress, {
+    agent: "BrandChecker",
+    status: "completed",
+    summary: `${passedBrand.length} passed, ${failedBrand.length} blocked`,
+    data: { validated: brandResult.validated.map((v) => ({ title: v.title, score: v.brandScore, passed: v.passed })) },
+  });
 
-  // ── 3. Merge: only topics that passed brand check ───────────────────────────
-  const approvedTopics: ValidatedTopic[] = brandResult.validated.filter(
-    (v) => v.passed
-  );
-  const flaggedByBrand = brandResult.validated.filter((v) => !v.passed);
-
-  console.log(
-    `[Pipeline] Approved topics: ${approvedTopics.length} | Brand-blocked: ${flaggedByBrand.length}`
-  );
+  // ── 3. Merge approved topics ────────────────────────────────────────────────
+  const approvedTopics: ValidatedTopic[] = passedBrand;
 
   if (approvedTopics.length === 0) {
-    console.warn("[Pipeline] No topics passed brand check — aborting run");
-    await saveRun({
-      runId,
-      runDate,
-      topicsProcessed: 0,
-      draftsPassed: 0,
-      draftsFlags: flaggedByBrand.length,
-    });
-    return {
-      runId,
-      runDate,
-      topicsProcessed: 0,
-      draftsPassed: 0,
-      draftsFlags: flaggedByBrand.length,
-      assets: [],
-    };
+    console.warn("[Pipeline] No topics passed brand check — aborting");
+    await saveRun({ runId, runDate, topicsProcessed: 0, draftsPassed: 0, draftsFlags: failedBrand.length });
+    return { runId, runDate, topicsProcessed: 0, draftsPassed: 0, draftsFlags: failedBrand.length, assets: [] };
   }
 
   // ── 4. Generation layer ─────────────────────────────────────────────────────
   console.log("[Pipeline] ── GENERATION LAYER ────────────────────────────");
 
-  // Track revision cycles per topic (max 2 before flagging for human review)
   const revisionCycles = new Map<string, number>();
   const humanReviewQueue: string[] = [];
 
-  // Initial generation
-  let activeDrafts: ContentGenerationResult =
-    await runContentGeneratorAgent(ctx, approvedTopics);
+  progress(onProgress, {
+    agent: "ContentGenerator",
+    status: "started",
+    summary: `Drafting ${approvedTopics.length} articles…`,
+  });
+  let activeDrafts: ContentGenerationResult = await runContentGeneratorAgent(ctx, approvedTopics);
+  progress(onProgress, {
+    agent: "ContentGenerator",
+    status: "completed",
+    summary: `${activeDrafts.drafts.length} drafts written`,
+    data: { drafts: activeDrafts.drafts.map((d) => ({ topic: d.topic, wordCount: d.wordCount })) },
+  });
 
   // CriticReviewer → revise loop
+  progress(onProgress, {
+    agent: "CriticReviewer",
+    status: "started",
+    summary: "Reviewing drafts…",
+  });
   let reviewResult = await runCriticReviewerAgent(ctx, activeDrafts);
-
   let failedReviews = reviewResult.reviews.filter((r) => !r.passed);
 
   while (failedReviews.length > 0) {
@@ -178,19 +243,15 @@ export async function runDailyPipeline(): Promise<PipelineResult> {
     const revisionMap = new Map<string, string>();
 
     for (const review of failedReviews) {
-      const cycleCount = (revisionCycles.get(review.topic) ?? 0) + 1;
-      revisionCycles.set(review.topic, cycleCount);
+      const cycle = (revisionCycles.get(review.topic) ?? 0) + 1;
+      revisionCycles.set(review.topic, cycle);
 
-      if (cycleCount >= 2) {
-        // Two strikes — flag for human review
+      if (cycle >= 2) {
         if (!humanReviewQueue.includes(review.topic)) {
-          console.warn(
-            `[Pipeline] "${review.topic}" flagged for human review after ${cycleCount} revision cycles`
-          );
+          console.warn(`[Pipeline] "${review.topic}" flagged after ${cycle} cycles`);
           humanReviewQueue.push(review.topic);
         }
       } else {
-        // Queue for revision
         const topicInfo = approvedTopics.find((t) => t.title === review.topic);
         if (topicInfo && review.revisionInstructions) {
           topicsNeedingRevision.push(topicInfo);
@@ -199,133 +260,114 @@ export async function runDailyPipeline(): Promise<PipelineResult> {
       }
     }
 
-    // Remove human-flagged drafts from active set
-    activeDrafts = {
-      drafts: activeDrafts.drafts.filter(
-        (d) => !humanReviewQueue.includes(d.topic)
-      ),
-    };
-
+    activeDrafts = { drafts: activeDrafts.drafts.filter((d) => !humanReviewQueue.includes(d.topic)) };
     if (topicsNeedingRevision.length === 0) break;
 
-    // Regenerate only the failing drafts
-    const revisedBatch = await runContentGeneratorAgent(
-      ctx,
-      topicsNeedingRevision,
-      revisionMap
-    );
+    const revisedBatch = await runContentGeneratorAgent(ctx, topicsNeedingRevision, revisionMap);
+    const revisedMap = new Map<string, Draft>(revisedBatch.drafts.map((d) => [d.topic, d]));
+    activeDrafts = { drafts: activeDrafts.drafts.map((d) => revisedMap.get(d.topic) ?? d) };
 
-    // Splice revised drafts back into activeDrafts
-    const revisedMap = new Map<string, Draft>(
-      revisedBatch.drafts.map((d) => [d.topic, d])
-    );
-    activeDrafts = {
-      drafts: activeDrafts.drafts.map((d) => revisedMap.get(d.topic) ?? d),
-    };
-
-    // Re-review the revised drafts only (optimisation: don't re-review already-passed ones)
-    const revisedTopicTitles = new Set(topicsNeedingRevision.map((t) => t.title));
-    const draftsToReReview: ContentGenerationResult = {
-      drafts: activeDrafts.drafts.filter((d) => revisedTopicTitles.has(d.topic)),
-    };
-
-    const reReviewResult = await runCriticReviewerAgent(ctx, draftsToReReview);
-
-    // Merge re-review results into overall reviewResult
-    for (const newReview of reReviewResult.reviews) {
-      const idx = reviewResult.reviews.findIndex(
-        (r) => r.topic === newReview.topic
-      );
-      if (idx >= 0) {
-        reviewResult.reviews[idx] = newReview;
-      }
+    const revisedTitles = new Set(topicsNeedingRevision.map((t) => t.title));
+    const reReviewResult = await runCriticReviewerAgent(ctx, { drafts: activeDrafts.drafts.filter((d) => revisedTitles.has(d.topic)) });
+    for (const r of reReviewResult.reviews) {
+      const idx = reviewResult.reviews.findIndex((x) => x.topic === r.topic);
+      if (idx >= 0) reviewResult.reviews[idx] = r;
     }
 
     failedReviews = reviewResult.reviews.filter(
-      (r) =>
-        !r.passed &&
-        !humanReviewQueue.includes(r.topic) &&
-        (revisionCycles.get(r.topic) ?? 0) < 2
+      (r) => !r.passed && !humanReviewQueue.includes(r.topic) && (revisionCycles.get(r.topic) ?? 0) < 2
     );
   }
 
-  // Final pass: flag any remaining failures for human review
-  for (const review of reviewResult.reviews) {
-    if (!review.passed && !humanReviewQueue.includes(review.topic)) {
-      humanReviewQueue.push(review.topic);
-      activeDrafts = {
-        drafts: activeDrafts.drafts.filter((d) => d.topic !== review.topic),
-      };
+  for (const r of reviewResult.reviews) {
+    if (!r.passed && !humanReviewQueue.includes(r.topic)) {
+      humanReviewQueue.push(r.topic);
+      activeDrafts = { drafts: activeDrafts.drafts.filter((d) => d.topic !== r.topic) };
     }
   }
 
   const passedDrafts: ContentGenerationResult = {
-    drafts: activeDrafts.drafts.filter((d) =>
-      reviewResult.reviews.find((r) => r.topic === d.topic)?.passed !== false
-    ),
+    drafts: activeDrafts.drafts.filter((d) => reviewResult.reviews.find((r) => r.topic === d.topic)?.passed !== false),
   };
 
-  console.log(
-    `[Pipeline] Drafts passed review: ${passedDrafts.drafts.length} | Flagged for human review: ${humanReviewQueue.length}`
-  );
+  progress(onProgress, {
+    agent: "CriticReviewer",
+    status: "completed",
+    summary: `${passedDrafts.drafts.length} passed, ${humanReviewQueue.length} flagged`,
+    data: {
+      reviews: reviewResult.reviews.map((r) => ({
+        topic: r.topic,
+        passed: r.passed,
+        scores: r.scores,
+        cycles: revisionCycles.get(r.topic) ?? 0,
+      })),
+    },
+  });
 
   if (passedDrafts.drafts.length === 0) {
-    console.warn("[Pipeline] No drafts passed review — skipping edit/adapt");
-    await saveRun({
-      runId,
-      runDate,
-      topicsProcessed: approvedTopics.length,
-      draftsPassed: 0,
-      draftsFlags: humanReviewQueue.length + flaggedByBrand.length,
-    });
-    return {
-      runId,
-      runDate,
-      topicsProcessed: approvedTopics.length,
-      draftsPassed: 0,
-      draftsFlags: humanReviewQueue.length,
-      assets: [],
-    };
+    await saveRun({ runId, runDate, topicsProcessed: approvedTopics.length, draftsPassed: 0, draftsFlags: humanReviewQueue.length });
+    return { runId, runDate, topicsProcessed: approvedTopics.length, draftsPassed: 0, draftsFlags: humanReviewQueue.length, assets: [] };
   }
 
-  // Edit
+  progress(onProgress, { agent: "Editor", status: "started", summary: "Final copy-edit…" });
   const editResult = await runEditorAgent(ctx, passedDrafts);
+  progress(onProgress, {
+    agent: "Editor",
+    status: "completed",
+    summary: `${editResult.edited.length} articles polished`,
+    data: { topics: editResult.edited.map((e) => e.topic) },
+  });
 
-  // Channel adaptation (Twitter/LinkedIn/newsletter run in parallel inside the agent)
+  progress(onProgress, { agent: "ChannelAdapter", status: "started", summary: "Adapting to 4 channels…" });
   const adaptResult = await runChannelAdapterAgent(ctx, editResult);
+  progress(onProgress, {
+    agent: "ChannelAdapter",
+    status: "completed",
+    summary: `${adaptResult.adapted.length} articles × 4 channels`,
+    data: { topics: adaptResult.adapted.map((a) => a.topic) },
+  });
 
-  // ── 5. Push to GitHub ───────────────────────────────────────────────────────
+  // ── 5. Save full outputs to DB ──────────────────────────────────────────────
+  for (const content of adaptResult.adapted) {
+    const brandInfo = brandResult.validated.find((v) => v.title === content.topic);
+    const reviewInfo = reviewResult.reviews.find((r) => r.topic === content.topic);
+    const topicInfo = approvedTopics.find((t) => t.title === content.topic);
+
+    try {
+      await savePipelineOutput({
+        runId,
+        topic: content.topic,
+        contentType: topicInfo?.type ?? "blog_post",
+        brandScore: brandInfo?.brandScore ?? 0,
+        reviewScores: reviewInfo?.scores ?? null,
+        blogContent: content.channels.blog,
+        twitterThread: content.channels.twitter_thread,
+        linkedinPost: content.channels.linkedin,
+        newsletterBlurb: content.channels.developer_newsletter,
+      });
+    } catch (err) {
+      console.error(`[Pipeline] Failed to save output for "${content.topic}":`, err);
+    }
+  }
+
+  // ── 6. Push to GitHub ───────────────────────────────────────────────────────
   console.log("[Pipeline] ── GITHUB OUTPUT ───────────────────────────────");
 
   for (const content of adaptResult.adapted) {
     const slug = slugify(content.topic);
     const filePath = `content/${runDate}/${slug}.md`;
-
-    const brandScore =
-      brandResult.validated.find((v) => v.title === content.topic)
-        ?.brandScore ?? 0;
-    const topicType =
-      approvedTopics.find((t) => t.title === content.topic)?.type ?? "blog_post";
-
-    const fileContent = formatContentFile(content, {
-      date: runDate,
-      type: topicType,
-      brandScore,
-    });
+    const brandScore = brandResult.validated.find((v) => v.title === content.topic)?.brandScore ?? 0;
+    const topicType = approvedTopics.find((t) => t.title === content.topic)?.type ?? "blog_post";
 
     try {
-      await pushToGitHub(
-        filePath,
-        fileContent,
-        `content: add ${slug} [run:${runId.slice(0, 8)}]`
-      );
+      await pushToGitHub(filePath, formatContentFile(content, { date: runDate, type: topicType, brandScore }), `content: add ${slug} [run:${runId.slice(0, 8)}]`);
       console.log(`[Pipeline] ✓ Pushed ${filePath}`);
     } catch (err) {
       console.error(`[Pipeline] ✗ Failed to push ${filePath}:`, err);
     }
   }
 
-  // ── 6. Persist run metadata ─────────────────────────────────────────────────
+  // ── 7. Persist run metadata ─────────────────────────────────────────────────
   await saveRun({
     runId,
     runDate,
@@ -334,7 +376,6 @@ export async function runDailyPipeline(): Promise<PipelineResult> {
     draftsFlags: humanReviewQueue.length,
   });
 
-  // ── 7. Return run summary ───────────────────────────────────────────────────
   const result: PipelineResult = {
     runId,
     runDate,
@@ -344,11 +385,6 @@ export async function runDailyPipeline(): Promise<PipelineResult> {
     assets: adaptResult.adapted,
   };
 
-  console.log(`\n[Pipeline] Run ${runId} complete.`);
-  console.log(
-    `           Topics processed: ${result.topicsProcessed} | Passed: ${result.draftsPassed} | Flagged: ${result.draftsFlags}`
-  );
-  console.log(`${"=".repeat(60)}\n`);
-
+  console.log(`\n[Pipeline] Run ${runId} complete — ${result.draftsPassed} passed, ${result.draftsFlags} flagged\n`);
   return result;
 }

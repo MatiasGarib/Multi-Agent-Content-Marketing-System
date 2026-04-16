@@ -15,13 +15,17 @@ import type {
   TopicPrioritizationResult,
 } from "../lib/types";
 
-const SYSTEM_PROMPT = `You are a content strategy director at GitHub. You decide which topics deserve production investment based on strategic value, uniqueness, and audience fit. You are ruthless about avoiding content that would cannibalize or duplicate existing GitHub docs, GitHub blog posts, or topics that GitHub covers so authoritatively that a new article adds no value.`;
+const BASE_SYSTEM_PROMPT = `You are a content strategy director at GitHub. You decide which topics deserve production investment based on strategic value, uniqueness, and audience fit. You are ruthless about avoiding content that would cannibalize or duplicate existing GitHub docs, GitHub blog posts, or topics that GitHub covers so authoritatively that a new article adds no value.`;
 
 export async function runTopicPrioritizerAgent(
   ctx: PipelineContext,
   keywordResult: KeywordResearchResult
 ): Promise<TopicPrioritizationResult> {
   console.log("[TopicPrioritizer] Selecting top 3 topics from keyword research");
+
+  const systemPrompt = ctx.feedbackContext
+    ? `${BASE_SYSTEM_PROMPT}\n\nLEARNINGS FROM PREVIOUS RUNS (apply these):\n${ctx.feedbackContext}`
+    : BASE_SYSTEM_PROMPT;
 
   const highValueKeywords = keywordResult.keywords
     .filter((k) => k.score >= 6)
@@ -60,7 +64,7 @@ Return ONLY valid JSON with no markdown fencing:
   ]
 }`;
 
-  const response = await callClaude(prompt, { systemPrompt: SYSTEM_PROMPT, maxTokens: 1500 });
+  const response = await callClaude(prompt, { systemPrompt, maxTokens: 1500 });
   const result = extractJson<TopicPrioritizationResult>(response);
 
   if (!Array.isArray(result.topics) || result.topics.length === 0) {

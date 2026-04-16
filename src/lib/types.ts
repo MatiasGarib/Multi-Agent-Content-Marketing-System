@@ -4,6 +4,7 @@ export interface PipelineContext {
   runId: string;
   date: string;
   seedTopics: string[];
+  feedbackContext: string; // prior human feedback learnings, injected into prompts
 }
 
 // ─── Parallel research layer ─────────────────────────────────────────────────
@@ -110,7 +111,7 @@ export interface PipelineResult {
   assets: AdaptedContent[];
 }
 
-// ─── Database row ─────────────────────────────────────────────────────────────
+// ─── Database rows ────────────────────────────────────────────────────────────
 
 export interface PipelineRunRow {
   id: number;
@@ -120,4 +121,53 @@ export interface PipelineRunRow {
   drafts_passed: number;
   drafts_flagged: number;
   created_at: string;
+}
+
+export interface PipelineOutputRow {
+  id: number;
+  run_id: string;
+  topic: string;
+  content_type: string;
+  brand_score: number;
+  review_scores: ReviewScores | null;
+  blog_content: string;
+  twitter_thread: string[];
+  linkedin_post: string;
+  newsletter_blurb: string;
+  created_at: string;
+}
+
+export interface ContentReviewRow {
+  id: number;
+  run_id: string;
+  topic: string;
+  approved: boolean;
+  feedback: string | null;
+  reviewed_at: string;
+}
+
+export interface FeedbackLearningRow {
+  id: number;
+  run_id: string;
+  approved_patterns: string[];
+  rejected_patterns: string[];
+  improvement_notes: string;
+  created_at: string;
+}
+
+// ─── SSE progress events ──────────────────────────────────────────────────────
+
+export interface ProgressEvent {
+  agent: string;
+  status: "started" | "completed" | "failed";
+  summary: string;
+  data?: unknown;
+  timestamp: string;
+}
+
+// ─── Pipeline options ─────────────────────────────────────────────────────────
+
+export interface PipelineOptions {
+  runId?: string;           // caller-supplied runId; pipeline generates one if omitted
+  onProgress?: (event: ProgressEvent) => void;
 }
