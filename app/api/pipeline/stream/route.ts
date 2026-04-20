@@ -1,53 +1,63 @@
 import { NextRequest } from "next/server";
-import { subscribe, unsubscribe } from "../../../../src/lib/event-bus";
+import { runDailyPipeline } from "../../../../src/pipeline/daily-pipeline";
 import type { ProgressEvent } from "../../../../src/lib/types";
 
 export const dynamic = "force-dynamic";
+export const maxDuration = 300;
 
 /**
- * GET /api/pipeline/stream?runId=<runId>
+ * GET /api/pipeline/stream
  *
- * Server-Sent Events stream. Stays open while the pipeline runs and forwards
- * every ProgressEvent emitted by the event bus for the given runId.
- * Closes automatically when it receives the "__done__" sentinel event.
+ * Opens an SSE stream AND starts the pipeline inline — no separate POST needed.
+ * All progress events are captured from the very first agent because the pipeline
+ * runs inside the stream's ReadableStream.start(), eliminating the timing gap
+ * that caused events to be lost with the previous event-bus approach.
+ *
+ * The first event sent is { agent: "__started__", data: { runId } } so the
+ * client knows which run it is watching.
  */
-export async function GET(request: NextRequest): Promise<Response> {
-  const runId = request.nextUrl.searchParams.get("runId");
-  if (!runId) {
-    return new Response("Missing runId query parameter", { status: 400 });
-  }
-
+export async function GET(_request: NextRequest): Promise<Response> {
   const encoder = new TextEncoder();
 
   const stream = new ReadableStream({
-    start(controller) {
-      const listener = (event: ProgressEvent) => {
-        const data = `data: ${JSON.stringify(event)}\n\n`;
-        controller.enqueue(encoder.encode(data));
-
-        if (event.agent === "__done__" || event.agent === "__error__") {
-          unsubscribe(runId, listener);
-          controller.close();
+    async start(controller) {
+      const send = (event: ProgressEvent) => {
+        try {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+        } catch {
+          // client disconnected — ignore
         }
       };
 
-      subscribe(runId, listener);
+      const runId = crypto.randomUUID();
 
-      // Send a heartbeat immediately so the client knows the connection is open
-      controller.enqueue(
-        encoder.encode(
-          `data: ${JSON.stringify({ agent: "__connected__", status: "started", summary: "Stream connected", timestamp: new Date().toISOString() })}\n\n`
-        )
-      );
+      // Tell the client the runId before anything else
+      send({
+        agent: "__started__",
+        status: "started",
+        summary: "Pipeline started",
+        data: { runId },
+        timestamp: new Date().toISOString(),
+      });
 
-      // Auto-close after 10 minutes to prevent zombie connections
-      setTimeout(() => {
-        unsubscribe(runId, listener);
-        try { controller.close(); } catch {}
-      }, 10 * 60 * 1000);
-    },
-    cancel() {
-      // Client disconnected — nothing to clean up since unsubscribe already handles it
+      try {
+        await runDailyPipeline({ runId, onProgress: send });
+      } catch (err) {
+        send({
+          agent: "__error__",
+          status: "failed",
+          summary: err instanceof Error ? err.message : String(err),
+          timestamp: new Date().toISOString(),
+        });
+      } finally {
+        send({
+          agent: "__done__",
+          status: "completed",
+          summary: "Pipeline finished",
+          timestamp: new Date().toISOString(),
+        });
+        try { controller.close(); } catch { /* already closed */ }
+      }
     },
   });
 
@@ -56,7 +66,7 @@ export async function GET(request: NextRequest): Promise<Response> {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache, no-transform",
       Connection: "keep-alive",
-      "X-Accel-Buffering": "no", // Disable Nginx buffering
+      "X-Accel-Buffering": "no",
     },
   });
 }
